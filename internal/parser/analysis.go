@@ -124,8 +124,25 @@ type (
 		// FuncFast is non-nil when the expression is a supported built-in function
 		// applied to a pure path (e.g. $exists(a.b), $lowercase(name)).
 		FuncFast *FuncFastPath
+		// BoolFast is non-nil when the expression is an and / or / $not
+		// composition of fast-path leaves.
+		BoolFast *BoolFastPath
 	}
 )
+
+var funcFastNames = func() map[FuncFastKind]string {
+	names := map[FuncFastKind]string{FuncFastContains: "contains"}
+	for name, kind := range funcFastKinds {
+		names[kind] = name
+	}
+	return names
+}()
+
+// FunctionName returns the built-in function's name as written in the
+// source, without the leading $.
+func (f *FuncFastPath) FunctionName() string {
+	return funcFastNames[f.Kind]
+}
 
 // AnalyzeFastPath examines an AST node and determines whether it qualifies
 // for zero-copy GJSON fast-path evaluation.
@@ -139,6 +156,8 @@ type (
 //     string / number / boolean / null literal  →  ComparisonFastPath
 //   - A supported built-in function applied to a pure path (e.g. $exists(a.b),
 //     $lowercase(name), $contains(path, "literal"))  →  FuncFastPath
+//   - An and / or / $not composition, optionally parenthesized or nested,
+//     whose leaves are all of the above  →  BoolFastPath
 //
 // An expression is NOT fast-path eligible if it contains:
 //   - Binary operators (+, -, *, /, comparisons, etc.) other than the above
@@ -162,6 +181,9 @@ func AnalyzeFastPath(node *Node) fastPathResult {
 	}
 	if fn := tryCollectFunc(node); fn != nil {
 		return fastPathResult{FuncFast: fn}
+	}
+	if b := tryCollectBool(node); b != nil {
+		return fastPathResult{BoolFast: b}
 	}
 	return fastPathResult{IsFastPath: false}
 }

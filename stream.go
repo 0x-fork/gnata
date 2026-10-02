@@ -25,6 +25,7 @@ type StreamEvaluator struct {
 	cache     *BoundedCache
 	metrics   MetricsHook // nil = no overhead
 	customEnv *evaluator.Environment
+	shadowed  map[string]struct{}
 }
 
 // MetricsHook receives evaluation telemetry from StreamEvaluator.
@@ -97,10 +98,15 @@ func NewStreamEvaluator(expressions []*Expression, opts ...StreamOption) *Stream
 	if len(cfg.customFuncs) > 0 {
 		customEnv = newEnv(cfg.customFuncs)
 	}
+	shadowed := make(map[string]struct{}, len(cfg.customFuncs))
+	for name := range cfg.customFuncs {
+		shadowed[name] = struct{}{}
+	}
 	se := &StreamEvaluator{
 		cache:     NewBoundedCache(cfg.maxSchemas),
 		metrics:   cfg.metrics,
 		customEnv: customEnv,
+		shadowed:  shadowed,
 	}
 	snap := make([]*Expression, len(expressions))
 	copy(snap, expressions)
@@ -282,7 +288,7 @@ func (se *StreamEvaluator) evalInternal(
 		var ok bool
 		plan, ok = se.cache.Get(cacheKey)
 		if !ok {
-			plan = buildPlan(expressions, exprIndices)
+			plan = buildPlan(expressions, exprIndices, se.shadowed)
 			evicted := se.cache.Set(cacheKey, plan)
 			if se.metrics != nil {
 				se.metrics.OnCacheMiss(schemaKey)
@@ -294,7 +300,7 @@ func (se *StreamEvaluator) evalInternal(
 			se.metrics.OnCacheHit(schemaKey)
 		}
 	} else {
-		plan = buildPlan(expressions, exprIndices)
+		plan = buildPlan(expressions, exprIndices, se.shadowed)
 	}
 
 	results = make([]any, len(exprIndices))
@@ -395,6 +401,20 @@ func (b *evalBatch) tryFastPaths(i, idx int, start time.Time) (result any, done 
 		}
 	}
 
+	if b.plan != nil && i < len(b.plan.BoolFast) && b.plan.BoolFast[i] != nil {
+		if result, handled, err := evalBool(b.plan.BoolFast[i], b.data, b.mapData); err != nil {
+			if b.se.metrics != nil {
+				b.se.metrics.OnEval(idx, true, time.Since(start), err)
+			}
+			return nil, true, err
+		} else if handled {
+			if b.se.metrics != nil {
+				b.se.metrics.OnEval(idx, true, time.Since(start), nil)
+			}
+			return result, true, nil
+		}
+	}
+
 	return nil, false, nil
 }
 
@@ -465,14 +485,15 @@ func planCacheKey(schemaKey string, exprIndices []int) string {
 }
 
 // buildPlan constructs a GroupPlan for the given expression indices.
-func buildPlan(expressions []*Expression, exprIndices []int) *GroupPlan {
+func buildPlan(expressions []*Expression, exprIndices []int, shadowed map[string]struct{}) *GroupPlan {
 	plan := &GroupPlan{
 		FastPaths:    make([]string, len(exprIndices)),
 		ExprFastPath: make([]bool, len(exprIndices)),
 		CmpFast:      make([]*parser.ComparisonFastPath, len(exprIndices)),
 		FuncFast:     make([]*parser.FuncFastPath, len(exprIndices)),
+		BoolFast:     make([]*parser.BoolFastPath, len(exprIndices)),
 	}
-	hasPure, hasCmp, hasFunc := false, false, false
+	hasPure, hasCmp, hasFunc, hasBool, needsDecode := false, false, false, false, false
 	for i, idx := range exprIndices {
 		if idx < 0 || idx >= len(expressions) {
 			continue
@@ -489,9 +510,14 @@ func buildPlan(expressions []*Expression, exprIndices []int) *GroupPlan {
 		case expr.cmpFast != nil:
 			plan.CmpFast[i] = expr.cmpFast
 			hasCmp = true
-		case expr.funcFast != nil:
+		case expr.funcFast != nil && !isShadowed(shadowed, expr.funcFast.FunctionName()):
 			plan.FuncFast[i] = expr.funcFast
 			hasFunc = true
+		case expr.boolFast != nil && !usesShadowedFunction(expr.boolFast, shadowed):
+			plan.BoolFast[i] = expr.boolFast
+			hasBool = true
+		default:
+			needsDecode = true
 		}
 	}
 	if !hasPure {
@@ -504,5 +530,26 @@ func buildPlan(expressions []*Expression, exprIndices []int) *GroupPlan {
 	if !hasFunc {
 		plan.FuncFast = nil
 	}
+	if !hasBool || needsDecode {
+		plan.BoolFast = nil
+	}
 	return plan
+}
+
+func isShadowed(shadowed map[string]struct{}, name string) bool {
+	_, ok := shadowed[name]
+	return ok
+}
+
+func usesShadowedFunction(b *parser.BoolFastPath, shadowed map[string]struct{}) bool {
+	if b == nil || len(shadowed) == 0 {
+		return false
+	}
+	if b.Op == parser.BoolFastNot && isShadowed(shadowed, "not") {
+		return true
+	}
+	if b.Func != nil && isShadowed(shadowed, b.Func.FunctionName()) {
+		return true
+	}
+	return usesShadowedFunction(b.Left, shadowed) || usesShadowedFunction(b.Right, shadowed)
 }
